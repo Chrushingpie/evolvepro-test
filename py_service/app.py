@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from dotenv import load_dotenv
@@ -84,6 +85,42 @@ async def update_agent(agent_id: int, body: AgentCreate):
 @app.delete("/agents/{agent_id}", status_code=204)
 async def delete_agent(agent_id: int):
     db.execute("DELETE FROM agents WHERE id = %s", (agent_id,))
+
+
+# ── Approvals ─────────────────────────────────────────────────
+
+@app.get("/approvals")
+async def list_approvals(status: Optional[str] = None):
+    if status:
+        return db.query(
+            "SELECT * FROM pending_approvals WHERE status = %s ORDER BY created_at DESC",
+            (status,),
+        )
+    return db.query("SELECT * FROM pending_approvals ORDER BY created_at DESC")
+
+
+class RejectBody(BaseModel):
+    reason: Optional[str] = None
+
+
+@app.post("/approvals/{approval_id}/approve")
+async def approve_action(approval_id: int):
+    db.execute(
+        "UPDATE pending_approvals SET status = 'approved', updated_at = NOW() WHERE id = %s",
+        (approval_id,),
+    )
+    rows = db.query("SELECT * FROM pending_approvals WHERE id = %s", (approval_id,))
+    return rows[0] if rows else {}
+
+
+@app.post("/approvals/{approval_id}/reject")
+async def reject_action(approval_id: int, body: RejectBody):
+    db.execute(
+        "UPDATE pending_approvals SET status = 'rejected', reason = %s, updated_at = NOW() WHERE id = %s",
+        (body.reason, approval_id),
+    )
+    rows = db.query("SELECT * FROM pending_approvals WHERE id = %s", (approval_id,))
+    return rows[0] if rows else {}
 
 
 @app.get("/agents/{agent_name}/memory")
@@ -220,6 +257,54 @@ async def chat(thread_id: int, body: ChatMessage):
     db.execute("UPDATE agents SET status = 'idle' WHERE name = %s", (body.agent_name,))
 
     return {"reply": reply, "agent": body.agent_name, "thread_id": thread_id}
+
+
+# ── Streaming chat ────────────────────────────────────────────
+
+@app.post("/threads/{thread_id}/chat/stream")
+async def chat_stream(thread_id: int, body: ChatMessage):
+    threads = db.query("SELECT * FROM threads WHERE id = %s", (thread_id,))
+    if not threads:
+        raise HTTPException(404, "Thread not found")
+    agents = db.query("SELECT * FROM agents WHERE name = %s", (body.agent_name,))
+    if not agents:
+        raise HTTPException(404, f"Agent '{body.agent_name}' not found")
+    ag = agents[0]
+
+    db.execute(
+        "INSERT INTO messages (thread_id, sender, role, content) VALUES (%s, 'user', 'user', %s)",
+        (thread_id, body.content),
+    )
+    db.execute("UPDATE agents SET status = 'busy' WHERE name = %s", (body.agent_name,))
+
+    async def generate():
+        full_reply = []
+        try:
+            async for event in agent_runner.stream_agent(
+                agent_name=ag["name"],
+                model=ag["model"],
+                system_prompt=ag["system_prompt"] or "",
+                thread_id=thread_id,
+                user_message=body.content,
+            ):
+                if event["type"] == "done":
+                    complete = event["content"]
+                    db.execute(
+                        "INSERT INTO messages (thread_id, sender, role, content) VALUES (%s, %s, 'assistant', %s)",
+                        (thread_id, body.agent_name, complete),
+                    )
+                    db.execute("UPDATE threads SET updated_at = NOW() WHERE id = %s", (thread_id,))
+                    db.execute("UPDATE agents SET status = 'idle' WHERE name = %s", (body.agent_name,))
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            db.execute("UPDATE agents SET status = 'error' WHERE name = %s", (body.agent_name,))
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Room (multi-agent chat) ───────────────────────────────────

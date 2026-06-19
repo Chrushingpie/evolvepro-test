@@ -1384,3 +1384,133 @@ body {
 
 .reg-repo   { color: #a0a0b8; font-family: 'Fira Code', monospace; font-size: .73rem; }
 .reg-status { color: #4a4a68; font-size: .7rem; text-align: right; }
+
+/* ── Nav badge ──────────────────────────────────────────────── */
+.nav-badge {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  min-width: 16px;
+  height: 16px;
+  background: #f87171;
+  border-radius: 8px;
+  font-size: .6rem;
+  font-weight: 800;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  pointer-events: none;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+/* ── Approvals ──────────────────────────────────────────────── */
+.approval-pending-badge {
+  background: rgba(250,204,21,.12);
+  border: 1px solid #facc15;
+  color: #facc15;
+  font-size: .75rem;
+  font-weight: 700;
+  padding: 4px 12px;
+  border-radius: 20px;
+}
+
+.approval-card {
+  background: #1c1c24;
+  border: 1px solid #2a2a36;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.approval-card-pending {
+  border-color: rgba(250,204,21,.5);
+  box-shadow: 0 0 0 1px rgba(250,204,21,.08);
+}
+
+.approval-card-history {
+  padding: 10px 14px;
+  margin-bottom: 0;
+}
+
+.approval-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.approval-agent-pill {
+  background: rgba(102,126,234,.15);
+  color: #667eea;
+  font-size: .72rem;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: 20px;
+  flex-shrink: 0;
+}
+
+.approval-action-text {
+  flex: 1;
+  font-size: .9rem;
+  font-weight: 600;
+  color: #e2e2e6;
+}
+
+.approval-time {
+  font-size: .72rem;
+  color: #4a4a62;
+  flex-shrink: 0;
+}
+
+.approval-details {
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-size: .76rem;
+  color: #9898b8;
+  background: #0e0e16;
+  border: 1px solid #2a2a36;
+  border-radius: 6px;
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.approval-status-badge {
+  font-size: .65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 20px;
+  color: #0a0a0f;
+  flex-shrink: 0;
+}
+
+.approval-reason {
+  font-size: .78rem;
+  color: #6a6a88;
+  margin-top: 6px;
+  font-style: italic;
+}
+
+/* ── Streaming cursor ───────────────────────────────────────── */
+.stream-cursor {
+  display: inline-block;
+  color: #667eea;
+  margin-left: 1px;
+  animation: blink .8s step-end infinite;
+  font-size: .9em;
+  vertical-align: baseline;
+}
+@keyframes blink { 50% { opacity: 0; } }

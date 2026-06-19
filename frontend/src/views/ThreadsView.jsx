@@ -19,10 +19,9 @@ export default function ThreadsView() {
   const [input, setInput]         = useState('');
   const [sending, setSending]     = useState(false);
   const bottomRef                 = useRef(null);
-  const sendingRef                = useRef(false);
   const selectedRef               = useRef(null);
+  const sendingRef                = useRef(false);
 
-  // Keep refs in sync so polling interval doesn't close over stale state
   useEffect(() => { sendingRef.current = sending; }, [sending]);
   useEffect(() => { selectedRef.current = selected; }, [selected]);
 
@@ -41,16 +40,9 @@ export default function ThreadsView() {
     setMessages(res.data);
   }, []);
 
-  useEffect(() => {
-    loadThreads();
-    loadAgents();
-  }, []);
+  useEffect(() => { loadThreads(); loadAgents(); }, []);
+  useEffect(() => { if (selected) loadMessages(selected.id); }, [selected]);
 
-  useEffect(() => {
-    if (selected) loadMessages(selected.id);
-  }, [selected]);
-
-  // Auto-poll: threads every 5s, messages every 4s (skip while sending)
   useEffect(() => {
     const t = setInterval(() => {
       loadThreads();
@@ -86,27 +78,105 @@ export default function ThreadsView() {
     const msg = input.trim();
     setInput('');
     setSending(true);
-    setMessages(m => [...m, {
-      id: `opt-${Date.now()}`, sender: 'user', role: 'user',
-      content: msg, created_at: new Date().toISOString(),
-    }]);
+
+    const streamId = `stream-${Date.now()}`;
+    setMessages(m => [
+      ...m,
+      { id: `opt-${Date.now()}`, sender: 'user', role: 'user', content: msg, created_at: new Date().toISOString() },
+      { id: streamId, sender: agentName, role: 'assistant', content: '', created_at: new Date().toISOString(), streaming: true },
+    ]);
+
     try {
-      await axios.post(`/api/threads/${selected.id}/chat`, { agent_name: agentName, content: msg });
+      const response = await fetch(`/api/threads/${selected.id}/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_name: agentName, content: msg }),
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.type === 'token') {
+              setMessages(m => m.map(msg =>
+                msg.id === streamId ? { ...msg, content: msg.content + data.content } : msg
+              ));
+            } else if (data.type === 'tool_start') {
+              setMessages(m => m.map(msg =>
+                msg.id === streamId ? { ...msg, activeTool: data.content } : msg
+              ));
+            } else if (data.type === 'tool_end') {
+              setMessages(m => m.map(msg =>
+                msg.id === streamId ? { ...msg, activeTool: null } : msg
+              ));
+            } else if (data.type === 'done') {
+              setMessages(m => m.map(msg =>
+                msg.id === streamId
+                  ? { ...msg, content: data.content || msg.content, streaming: false, activeTool: null }
+                  : msg
+              ));
+            } else if (data.type === 'error') {
+              setMessages(m => m.map(msg =>
+                msg.id === streamId
+                  ? { ...msg, content: `Error: ${data.content}`, streaming: false, role: 'system' }
+                  : msg
+              ));
+            }
+          } catch {}
+        }
+      }
+
       await loadMessages(selected.id);
       await loadThreads();
     } catch (err) {
-      setMessages(m => [...m, {
-        id: `err-${Date.now()}`, sender: 'system', role: 'system',
-        content: `Error: ${err.response?.data?.detail ?? err.message}`,
-        created_at: new Date().toISOString(),
-      }]);
+      setMessages(m => m.map(msg =>
+        msg.id === streamId
+          ? { ...msg, content: `Error: ${err.message}`, streaming: false, role: 'system' }
+          : msg
+      ));
     }
     setSending(false);
   };
 
+  const renderBubble = (m) => {
+    if (m.role !== 'assistant') return m.content;
+    if (m.streaming && !m.content && !m.activeTool) {
+      return <div className="typing-indicator"><span /><span /><span /></div>;
+    }
+    if (m.activeTool && !m.content) {
+      return (
+        <span style={{ color: '#667eea', fontSize: '.82rem', fontStyle: 'italic' }}>
+          calling {m.activeTool}…
+        </span>
+      );
+    }
+    return (
+      <>
+        <div className="md"><ReactMarkdown>{m.content}</ReactMarkdown></div>
+        {m.activeTool && (
+          <div style={{ marginTop: 6, color: '#667eea', fontSize: '.78rem', fontStyle: 'italic' }}>
+            calling {m.activeTool}…
+          </div>
+        )}
+        {m.streaming && <span className="stream-cursor">▋</span>}
+      </>
+    );
+  };
+
   return (
     <div className="threads-layout">
-      {/* ── Thread list ── */}
       <div className="thread-list">
         <div className="thread-list-header">
           <span>Conversations</span>
@@ -120,15 +190,12 @@ export default function ThreadsView() {
             onClick={() => setSelected(t)}
           >
             <div className="thread-title">{t.title ?? `Thread #${t.id}`}</div>
-            <div className="thread-meta">
-              {t.message_count} msg · {smartTime(t.updated_at)}
-            </div>
+            <div className="thread-meta">{t.message_count} msg · {smartTime(t.updated_at)}</div>
             <button className="thread-delete" onClick={e => deleteThread(e, t.id)}>✕</button>
           </div>
         ))}
       </div>
 
-      {/* ── Chat panel ── */}
       <div className="chat-panel">
         {!selected ? (
           <div className="chat-empty">
@@ -148,25 +215,12 @@ export default function ThreadsView() {
               {messages.map(m => (
                 <div key={m.id} className={`message message-${m.role}`}>
                   <div className="message-sender">{m.sender}</div>
-                  <div className="message-bubble">
-                    {m.role === 'assistant'
-                      ? <div className="md"><ReactMarkdown>{m.content}</ReactMarkdown></div>
-                      : m.content
-                    }
-                  </div>
+                  <div className="message-bubble">{renderBubble(m)}</div>
                   <div className="message-time">
                     {new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </div>
                 </div>
               ))}
-              {sending && (
-                <div className="message message-assistant">
-                  <div className="message-sender">{agentName}</div>
-                  <div className="message-bubble typing-indicator">
-                    <span /><span /><span />
-                  </div>
-                </div>
-              )}
               <div ref={bottomRef} />
             </div>
 

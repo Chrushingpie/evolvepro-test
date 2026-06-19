@@ -85,6 +85,24 @@ export default function SettingsView() {
     setRegistering(false);
   };
 
+  const [newRepo, setNewRepo] = useState('');
+
+  const blockedRepos = (settings.blocked_repos?.value ?? '')
+    .split(',').map(r => r.trim()).filter(Boolean);
+
+  const addBlockedRepo = async () => {
+    const repo = newRepo.trim();
+    if (!repo) return;
+    const updated = [...new Set([...blockedRepos, repo])].join(',');
+    await patch('blocked_repos', updated);
+    setNewRepo('');
+  };
+
+  const removeBlockedRepo = async (repo) => {
+    const updated = blockedRepos.filter(r => r !== repo).join(',');
+    await patch('blocked_repos', updated);
+  };
+
   const enabled   = settings.autonomous_enabled?.value === 'true';
   const interval  = settings.autonomous_interval_minutes?.value ?? '30';
   const lastRun   = settings.autonomous_last_run?.value ?? '';
@@ -218,6 +236,50 @@ export default function SettingsView() {
                 <span className="event-icon">{e.sender === 'github' ? '⚡' : '⏰'}</span>
                 <span className="event-text">{e.content.replace('[GitHub] ', '')}</span>
                 <span className="event-time">{smartTime(e.created_at)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* ── Blocked Repos ── */}
+        <div className="settings-card">
+          <div className="settings-card-title">
+            <span className="settings-card-icon">🚫</span>
+            Blocked Repos
+          </div>
+          <p className="settings-desc">
+            Agents will refuse to read, write, or interact with any repo on this list.
+            Use the format <code>owner/repo</code>.
+          </p>
+
+          <div className="webhook-url-row" style={{ marginBottom: 8 }}>
+            <input
+              className="chat-input"
+              value={newRepo}
+              onChange={e => setNewRepo(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && addBlockedRepo()}
+              placeholder="owner/repo-name"
+              style={{ fontFamily: 'monospace', fontSize: '.82rem' }}
+            />
+            <button className="btn-primary" onClick={addBlockedRepo} style={{ flexShrink: 0 }}>
+              Block
+            </button>
+          </div>
+
+          <div className="event-list">
+            {blockedRepos.length === 0 && (
+              <div className="settings-empty">No repos blocked</div>
+            )}
+            {blockedRepos.map(repo => (
+              <div key={repo} className="event-row" style={{ justifyContent: 'space-between' }}>
+                <span style={{ fontFamily: 'monospace', fontSize: '.82rem' }}>{repo}</span>
+                <button
+                  className="memory-forget"
+                  onClick={() => removeBlockedRepo(repo)}
+                  title="Unblock"
+                >
+                  ✕
+                </button>
               </div>
             ))}
           </div>

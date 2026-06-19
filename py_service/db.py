@@ -94,6 +94,17 @@ CREATE TABLE IF NOT EXISTS settings (
     value       TEXT         NOT NULL DEFAULT '',
     updated_at  TIMESTAMPTZ  DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    id          SERIAL PRIMARY KEY,
+    agent_name  VARCHAR(100) NOT NULL,
+    action      VARCHAR(255) NOT NULL,
+    details     TEXT,
+    status      VARCHAR(20)  NOT NULL DEFAULT 'pending',
+    reason      TEXT,
+    created_at  TIMESTAMPTZ  DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  DEFAULT NOW()
+);
 """
 
 DEFAULT_AGENTS = [
@@ -140,6 +151,22 @@ DEFAULT_AGENTS = [
             "Use remember() to save important context: client preferences, ongoing conversations, follow-up dates, "
             "communication history. Use list_memories() before handling client tasks so you have full context. "
             "When assigned a task, complete it thoroughly and report back to the coordinator."
+        ),
+    },
+    {
+        "name": "qa",
+        "role": "QA Engineer",
+        "model": "gpt-oss:20b",
+        "system_prompt": (
+            "You are the QA agent for EvolvePro. Your job is to review code changes, identify bugs, and ensure quality. "
+            "When asked to review a repo or PR: (1) use github_list_directory_recursive to map the codebase, "
+            "(2) use github_get_file to read relevant source files, (3) use github_get_diff to understand what changed, "
+            "(4) use github_list_issues to check for known bugs. "
+            "File your findings as GitHub issues using github_create_issue with clear titles and reproduction steps. "
+            "Use request_approval before closing any issue or creating a PR. "
+            "Focus on: broken logic, missing error handling, security issues, and missing edge cases. "
+            "Use remember() to save context about recurring issues or areas of the codebase that need attention. "
+            "Be specific and actionable — no vague feedback."
         ),
     },
 ]
@@ -199,6 +226,7 @@ def init_db() -> None:
     for row in [
         ("autonomous_enabled", "false"),
         ("autonomous_interval_minutes", "30"),
+        ("blocked_repos", ""),
     ]:
         execute(
             "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",

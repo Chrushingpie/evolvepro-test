@@ -1,4 +1,4 @@
-import os, json
+import os, json, time, asyncio
 from typing import Optional
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
@@ -262,6 +262,34 @@ def make_tools(agent_name: str):
         )
         return f"Forgotten: {key}"
 
+    @tool
+    def request_approval(action: str, details: str = "") -> str:
+        """Request human approval before proceeding with a sensitive or irreversible action (e.g. push to main, delete files, email client). Blocks until approved or rejected (up to 8 minutes). Returns 'approved' or 'rejected: reason'."""
+        rows = db.query(
+            "INSERT INTO pending_approvals (agent_name, action, details) VALUES (%s, %s, %s) RETURNING id",
+            (agent_name, action, details),
+        )
+        approval_id = rows[0]["id"]
+        hub_id = get_or_create_hub()
+        db.execute(
+            "INSERT INTO messages (thread_id, sender, role, content) VALUES (%s, %s, 'system', %s)",
+            (hub_id, agent_name, f"⏸ Awaiting approval for: **{action}**"),
+        )
+        db.execute("UPDATE threads SET updated_at = NOW() WHERE id = %s", (hub_id,))
+        for _ in range(160):  # 160 × 3s = 8 min
+            time.sleep(3)
+            rows = db.query(
+                "SELECT status, reason FROM pending_approvals WHERE id = %s", (approval_id,)
+            )
+            if rows and rows[0]["status"] != "pending":
+                s, r = rows[0]["status"], rows[0].get("reason") or ""
+                return "approved" if s == "approved" else (f"rejected: {r}" if r else "rejected")
+        db.execute(
+            "UPDATE pending_approvals SET status = 'timeout', updated_at = NOW() WHERE id = %s",
+            (approval_id,),
+        )
+        return "rejected: approval timed out after 8 minutes — do not proceed"
+
     base = [
         send_message_to_agent,
         list_tasks,
@@ -273,11 +301,42 @@ def make_tools(agent_name: str):
         recall,
         list_memories,
         forget,
+        request_approval,
     ]
-    # Only coordinator can create tasks and dispatch agents
+    # Only coordinator can create tasks, dispatch agents, and draft plans
     if agent_name == "coordinator":
-        base = [create_task, dispatch_to_agent] + base
-    if agent_name == "dev":
+        @tool
+        def draft_plan(plan: str) -> str:
+            """Post a multi-step plan to the hub and wait for human approval before executing. Use for any complex task before starting work. Returns 'approved' or 'rejected: reason'."""
+            hub_id = get_or_create_hub()
+            db.execute(
+                "INSERT INTO messages (thread_id, sender, role, content) VALUES (%s, %s, 'assistant', %s)",
+                (hub_id, agent_name, f"📋 **Draft Plan** (awaiting your approval):\n\n{plan}"),
+            )
+            db.execute("UPDATE threads SET updated_at = NOW() WHERE id = %s", (hub_id,))
+            rows = db.query(
+                "INSERT INTO pending_approvals (agent_name, action, details) VALUES (%s, %s, %s) RETURNING id",
+                (agent_name, "Execute plan", plan),
+            )
+            approval_id = rows[0]["id"]
+            for _ in range(160):
+                time.sleep(3)
+                rows = db.query(
+                    "SELECT status, reason FROM pending_approvals WHERE id = %s", (approval_id,)
+                )
+                if rows and rows[0]["status"] != "pending":
+                    s, r = rows[0]["status"], rows[0].get("reason") or ""
+                    if s == "approved":
+                        return "Plan approved — proceed with execution."
+                    return f"Plan rejected: {r or 'no reason given'}. Do not proceed."
+            db.execute(
+                "UPDATE pending_approvals SET status = 'timeout', updated_at = NOW() WHERE id = %s",
+                (approval_id,),
+            )
+            return "Plan approval timed out. Do not proceed without explicit confirmation."
+
+        base = [create_task, dispatch_to_agent, draft_plan] + base
+    if agent_name in ("dev", "qa"):
         base += _make_github_tools()
     return base
 
@@ -291,6 +350,13 @@ def _make_github_tools() -> list:
         if not token or token == "YOUR_GITHUB_PAT_HERE":
             raise ValueError("GITHUB_TOKEN is not configured in .env")
         return Github(auth=Auth.Token(token))
+
+    def _is_blocked(repo_full_name: str) -> bool:
+        rows = db.query("SELECT value FROM settings WHERE key = 'blocked_repos'")
+        if not rows or not rows[0]["value"].strip():
+            return False
+        blocked = [r.strip().lower() for r in rows[0]["value"].split(",") if r.strip()]
+        return repo_full_name.lower() in blocked
 
     @tool
     def github_whoami() -> str:
@@ -321,8 +387,81 @@ def _make_github_tools() -> list:
             return f"Error: {e.data.get('message', str(e))}"
 
     @tool
+    def github_list_directory(repo_full_name: str, path: str = "", branch: str = "main") -> str:
+        """List files and folders in a directory of a GitHub repo. Use path='' for the root. Returns names, types (file/dir), and paths."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
+        g = _gh()
+        try:
+            repo = g.get_repo(repo_full_name)
+            contents = repo.get_contents(path, ref=branch)
+            if not isinstance(contents, list):
+                contents = [contents]
+            items = [{"name": c.name, "type": c.type, "path": c.path} for c in contents]
+            return json.dumps(items)
+        except GithubException as e:
+            return f"Error: {e.data.get('message', str(e))}"
+
+    @tool
+    def github_list_directory_recursive(repo_full_name: str, path: str = "", branch: str = "main", max_depth: int = 3) -> str:
+        """Recursively list all files and folders in a repo directory tree. path='' starts from root. max_depth limits traversal depth (default 3)."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
+        g = _gh()
+        try:
+            repo = g.get_repo(repo_full_name)
+            def _walk(p, depth):
+                if depth > max_depth:
+                    return []
+                try:
+                    contents = repo.get_contents(p, ref=branch)
+                    if not isinstance(contents, list):
+                        contents = [contents]
+                    items = []
+                    for c in contents:
+                        items.append({"name": c.name, "type": c.type, "path": c.path})
+                        if c.type == "dir":
+                            items.extend(_walk(c.path, depth + 1))
+                    return items
+                except GithubException:
+                    return []
+            return json.dumps(_walk(path, 0))
+        except GithubException as e:
+            return f"Error: {e.data.get('message', str(e))}"
+
+    @tool
+    def github_get_diff(repo_full_name: str, base: str = "main", head: str = "HEAD") -> str:
+        """Get the diff between two branches or commits. Returns changed files with patch snippets."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
+        g = _gh()
+        try:
+            repo = g.get_repo(repo_full_name)
+            comparison = repo.compare(base, head)
+            files = [
+                {
+                    "filename": f.filename,
+                    "status": f.status,
+                    "additions": f.additions,
+                    "deletions": f.deletions,
+                    "patch": (f.patch or "")[:600],
+                }
+                for f in comparison.files[:25]
+            ]
+            return json.dumps({
+                "ahead_by": comparison.ahead_by,
+                "behind_by": comparison.behind_by,
+                "total_commits": comparison.total_commits,
+                "files": files,
+            })
+        except GithubException as e:
+            return f"Error: {e.data.get('message', str(e))}"
+
+    @tool
     def github_get_file(repo_full_name: str, path: str, branch: str = "main") -> str:
         """Get the contents of a file in a repo. repo_full_name format: 'owner/repo'."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
         g = _gh()
         try:
             repo = g.get_repo(repo_full_name)
@@ -337,6 +476,8 @@ def _make_github_tools() -> list:
         repo_full_name: str, path: str, content: str, commit_message: str, branch: str = "main"
     ) -> str:
         """Create or update a file in a GitHub repo. content is the raw text to write."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
         g = _gh()
         try:
             repo = g.get_repo(repo_full_name)
@@ -354,6 +495,8 @@ def _make_github_tools() -> list:
     @tool
     def github_list_issues(repo_full_name: str, state: str = "open") -> str:
         """List issues in a repo. state: open, closed, or all."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
         g = _gh()
         try:
             repo = g.get_repo(repo_full_name)
@@ -369,6 +512,8 @@ def _make_github_tools() -> list:
     @tool
     def github_create_issue(repo_full_name: str, title: str, body: str = "") -> str:
         """Create a new issue in a GitHub repo."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
         g = _gh()
         try:
             repo = g.get_repo(repo_full_name)
@@ -380,6 +525,8 @@ def _make_github_tools() -> list:
     @tool
     def github_close_issue(repo_full_name: str, issue_number: int, comment: str = "") -> str:
         """Close a GitHub issue, optionally leaving a comment."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
         g = _gh()
         try:
             repo = g.get_repo(repo_full_name)
@@ -396,6 +543,8 @@ def _make_github_tools() -> list:
         repo_full_name: str, title: str, body: str, head: str, base: str = "main"
     ) -> str:
         """Create a pull request. head is the branch with changes, base is the target branch."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
         g = _gh()
         try:
             repo = g.get_repo(repo_full_name)
@@ -407,6 +556,8 @@ def _make_github_tools() -> list:
     @tool
     def github_list_branches(repo_full_name: str) -> str:
         """List all branches in a GitHub repo."""
+        if _is_blocked(repo_full_name):
+            return f"Repo '{repo_full_name}' is blocked and cannot be accessed."
         g = _gh()
         try:
             repo = g.get_repo(repo_full_name)
@@ -419,6 +570,9 @@ def _make_github_tools() -> list:
         github_whoami,
         github_list_repos,
         github_create_repo,
+        github_list_directory,
+        github_list_directory_recursive,
+        github_get_diff,
         github_get_file,
         github_create_or_update_file,
         github_list_issues,
@@ -490,6 +644,81 @@ async def run_agent(
             await _execute_dispatch(content)
 
     return reply
+
+
+async def stream_agent(
+    agent_name: str,
+    model: str,
+    system_prompt: str,
+    thread_id: int,
+    user_message: Optional[str] = None,
+):
+    """Async generator that streams token events from a LangGraph agent run."""
+    llm = ChatOllama(
+        model=model,
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        temperature=0.3,
+    )
+    tools = make_tools(agent_name)
+    graph = create_react_agent(llm, tools)
+
+    memories = db.query(
+        "SELECT key, value FROM agent_memory WHERE agent_name = %s ORDER BY updated_at DESC",
+        (agent_name,),
+    )
+    if memories:
+        memory_block = "## Your persistent memory:\n" + "\n".join(
+            f"- [{m['key']}] {m['value']}" for m in memories
+        )
+        full_system_prompt = memory_block + "\n\n" + system_prompt
+    else:
+        full_system_prompt = system_prompt
+
+    history = db.query(
+        """SELECT role, content FROM messages
+           WHERE thread_id = %s AND role IN ('user', 'assistant')
+           ORDER BY created_at DESC LIMIT 30""",
+        (thread_id,),
+    )
+    history = list(reversed(history))
+    messages = [SystemMessage(content=full_system_prompt)]
+    for row in history:
+        cls = HumanMessage if row["role"] == "user" else AIMessage
+        messages.append(cls(content=row["content"]))
+    if user_message:
+        messages.append(HumanMessage(content=user_message))
+
+    db.execute(
+        "INSERT INTO agent_logs (agent_name, type, message) VALUES (%s, 'start', %s)",
+        (agent_name, f"Starting stream (thread {thread_id})"),
+    )
+
+    full_reply = []
+    async for event in graph.astream_events(
+        {"messages": messages},
+        version="v2",
+        config={"callbacks": [AgentLogger(agent_name)]},
+    ):
+        kind = event["event"]
+        if kind == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            content = chunk.content
+            if content and isinstance(content, str):
+                full_reply.append(content)
+                yield {"type": "token", "content": content}
+        elif kind == "on_tool_start":
+            yield {"type": "tool_start", "content": event.get("name", "tool")}
+        elif kind == "on_tool_end":
+            yield {"type": "tool_end", "content": ""}
+
+    complete = "".join(full_reply)
+    # Fire any dispatches as background tasks
+    for line in complete.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("__DISPATCH__:"):
+            asyncio.create_task(_execute_dispatch(stripped))
+
+    yield {"type": "done", "content": complete}
 
 
 async def _execute_dispatch(dispatch_token: str) -> None:
